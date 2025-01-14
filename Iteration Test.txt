@@ -1,0 +1,9 @@
+G: 104
+electrodeConfig: VCB
+voltage: 4.16
+T: 197
+D: 914.4
+width: 762
+height: 1143
+depth: 204
+

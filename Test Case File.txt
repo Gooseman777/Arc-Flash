@@ -1,0 +1,19 @@
+I_bf: 15
+G: 104
+electrodeConfig: VCB
+voltage: 4.16
+T: 197
+D: 914.4
+width: 762
+height: 1143
+depth: 204
+
+I_bf: 45
+G: 32
+electrodeConfig: VCB
+voltage: 0.48
+T: 61.3
+D: 609.6
+width: 610
+height: 610
+depth: 254
