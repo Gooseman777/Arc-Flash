@@ -1,4 +1,11 @@
 import math
+import sqlite3
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.signal import find_peaks
 
 ## Idea/ Steps for Arc Flash
     # Determine arcing current 
@@ -17,6 +24,62 @@ import math
         # 600 - 15000V use equations 7, 8, 9, then use 22, 23, 24 and 4.9 to find the final arc-flash boundary
         # 208 - 600V use equation 10 and 4.10
     # Reiterate using 4.5
+
+# ==== DATABASE CLASS START ====
+class ArcFlashDatabase:
+    def __init__(self):
+        self.conn = sqlite3.connect('arc_flash_components.db')
+        self.create_tables()
+        
+    def create_tables(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS components (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS component_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                component_id INTEGER,
+                x REAL,
+                y REAL,
+                FOREIGN KEY (component_id) REFERENCES components(id)
+            )
+        ''')
+        self.conn.commit()
+        
+    def get_components(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name FROM components")
+        return [row[0] for row in cursor.fetchall()]
+        
+    def add_component(self, name):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("INSERT INTO components (name) VALUES (?)", (name,))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+            
+    def add_data_point(self, component_name, x, y):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM components WHERE name = ?", (component_name,))
+        component_id = cursor.fetchone()
+        if component_id:
+            cursor.execute("INSERT INTO component_data (component_id, x, y) VALUES (?, ?, ?)",
+                          (component_id[0], x, y))
+            self.conn.commit()
+            return True
+        return False
+        
+    def delete_component(self, name):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM components WHERE name = ?", (name,))
+        self.conn.commit()
+# ==== DATABASE CLASS END ====
 
 # Define coefficients for different systems
     # fix values but the concept works
@@ -66,6 +129,12 @@ coefficientsInterIE = {
     'HOA_14300':  {'k1': 2.04049,  'k2': 0.177, 'k3': 1.005092,  'k4': 0,          'k5': 0,          'k6': 7.859E-10,  'k7': 7.859E-10,   'k8': -9.128E-06, 'k9': -0.0007,   'k10': 0.9981, 'k11': -0.05, 'k12': -1.633, 'k13': 1.151 }
 }
 
+# Global Variables
+I_arc_600 = I_arc_2700 = I_arc_14300 = I_arc_less600 = 0
+
+
+
+
 # Equation 1
 def calc_intermediate_arcing_current(I_bf, G, electrodeConfig, voltage):
     system_type = f"{electrodeConfig}_{voltage}V"
@@ -114,6 +183,7 @@ def calc_final_arc_current(voltage):
     I_arc_2 = ((I_arc_14300 - I_arc_2700) / 11.6) * (voltage - 14.3) + I_arc_14300
     I_arc_3 = ((I_arc_1 * (2.7 - voltage)) / 2.1) + ((I_arc_2 * (voltage - 0.6)) / 2.1)
     
+
     if voltage > 0.6 and voltage < 2.7:
         return I_arc_3
     else:
@@ -267,7 +337,6 @@ def incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig):
         E_less600 = (12.552 / 50) * T * 10**(k1 + k2 * math.log10(G) + (k3 * I_arc_600) / 
             (k4 * I_bf**7 + k5 * I_bf**6 + k6 * I_bf**5 + k7 * I_bf**4 + k8 * I_bf**3 + k9 * I_bf**2 + k10 * I_bf) +
             k11 * math.log10(I_bf) + k12 * math.log10(D) + k13 * math.log10(I_arc_less600) + math.log10(1 / CF))
-        print("Incident energy works")
         return E_less600
     #Calculates the total Incident Energy
     else:
@@ -315,7 +384,6 @@ def calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig):
         AFB_600Less = 10**(((k1 + k2*math.log10(G)) + (k3*I_arc_600)/(k4*(I_bf**7) + k5*(I_bf**6) + k6*(I_bf**5) + k7*(I_bf**4) +
                    k8*(I_bf**3) + k9*(I_bf**2) + k10*I_bf) + (k11*math.log10(I_bf) + k13*math.log10(I_arc_600) + 
                    math.log10(1/CF) - math.log10(20/T)))/(-k12))
-        print(f"ARC Flash Works")
         return AFB_600Less
     else:
         # Equation 7
@@ -395,96 +463,380 @@ def calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig):
             return AFB3    
      
 
+
 # Initialize count and global variables
-count = 1
-I_arc_600 = I_arc_2700 = I_arc_14300 = I_arc_less600 = None
+def read_scenarios_from_file(file_path):
+    scenarios = []
+    with open(file_path, 'r') as file:
+        scenario = {}
+        for line in file:
+            line = line.strip()
+            if not line:
+                if scenario:  # Add completed scenario to the list
+                    scenarios.append(scenario)
+                    scenario = {}
+                continue
+            key, value = line.split(":")
+            key = key.strip()
+            value = value.strip()
+            if value.isdigit():
+                scenario[key] = int(value)
+            else:
+                try:
+                    scenario[key] = float(value)
+                except ValueError:
+                    scenario[key] = value
+        if scenario:  # Add the last scenario if not added
+            scenarios.append(scenario)
+    return scenarios
 
-def values(count):
-    if count == 1:
-        # High Voltage
-        I_bf = 15  # Example bolted fault current (kA)
-        G = 104  # Example gap distance (mm)
-        electrodeConfig = 'VCB'  # Example system type
-        voltage = 4.16  # (kV)
-        T = 197  # (ms)
-        D = 914.4  # Working Distance, in mm
-        width = 762  # (mm)
-        height = 1143  # (mm)
-        depth = 204  # Only relevant for certain systems
+def process_scenarios(file_path):
+    global I_arc_600, I_arc_2700, I_arc_14300, I_arc_less600
+    scenarios = read_scenarios_from_file(file_path)
+
+    results = []  # Collect results to write to the output file
+
+    for index, params in enumerate(scenarios):
+        result = f"Processing Scenario {index + 1}\n"
+        
+        I_bf = params.get("I_bf")
+        G = params.get("G")
+        electrodeConfig = params.get("electrodeConfig")
+        voltage = params.get("voltage")
+        T = params.get("T")
+        D = params.get("D")
+        width = params.get("width")
+        height = params.get("height")
+        depth = params.get("depth")
+        
+        # Calculate arcing currents
+        I_arc_600 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 600)
+        I_arc_2700 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 2700)
+        I_arc_14300 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 14300)
+        I_arc_less600 = calc_final_arc_current_lv(voltage, I_bf, G, electrodeConfig)
+        
+        if 0.6 < voltage <= 15:
+            result += f"High Voltage\n"
+            I_arc_Final = calc_final_arc_current(voltage)
+            result += f"Final arcing current: {I_arc_Final} kA\n"
+            CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
+            IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
+            result += f"Incident Energy: {IE} cal/cm2\n"
+            Boundary = calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig)
+            result += f"Arc Flash Boundary: {Boundary} mm\n"
+        elif 0.208 <= voltage <= 0.6:
+            result += f"Low Voltage\n"
+            I_arc_Final = calc_final_arc_current_lv(voltage, I_bf, G, electrodeConfig)
+            result += f"Final arcing current: {I_arc_Final} kA\n"
+            CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
+            IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
+            result += f"Incident Energy: {IE} cal/cm2\n"
+            Boundary = calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig)
+            result += f"Arc Flash Boundary: {Boundary} mm\n"
+
+        results.append(result)
+
+    # Write results to a text file in the same folder as the input file
+    folder_path = os.path.dirname(file_path)
+    output_file_path = os.path.join(folder_path, "results_output.txt")
+    
+    with open(output_file_path, 'w') as output_file:
+        output_file.write("\n".join(results))
+    
+    print(f"Results written to {output_file_path}")
+    return output_file_path
+
+def validate_inputs(**kwargs):
+    """
+    Validate inputs to ensure they are within a valid mathematical domain.
+    Returns True if all inputs are valid; otherwise raises a ValueError.
+    """
+    for key, value in kwargs.items():
+        if value is None:
+            raise ValueError(f"{key} is None.")
+        if isinstance(value, (int, float)) and value <= 0:
+            raise ValueError(f"{key} must be positive. Got {value}.")
+    return True
+
+
+
+def plot_valid_values(results, output_file_path="incident_energy_vs_ibf.png"):
+    """
+    Plot all valid (I_bf, incident energy) pairs on a graph, highlight the maximum value,
+    local maxima, and save the graph as an image.
+    
+    Parameters:
+    - results: A list of dictionaries containing 'I_bf' and 'IE' for valid scenarios.
+    - output_file_path: Path where the image will be saved (default is 'incident_energy_vs_ibf.png').
+    """
+    if not results:
+        print("No valid data to plot.")
+        return
+
+    # Extract valid values
+    I_bf_values = [result['I_bf'] for result in results]
+    IE_values = [result['IE'] for result in results]
+
+    # Find the maximum value
+    max_index = IE_values.index(max(IE_values))
+    max_I_bf = I_bf_values[max_index]
+    max_IE = IE_values[max_index]
+
+    # Find local maxima
+    peaks, _ = find_peaks(IE_values)
+    
+    # Plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(I_bf_values, IE_values, label='Incident Energy vs I_bf', marker='o')
+    
+    # Highlight the global maximum
+    plt.scatter([max_I_bf], [max_IE], color='red', label=f'Max: I_bf={max_I_bf}, IE={max_IE:.2f}', s=100)
+
+    # Highlight local maxima
+    plt.scatter([I_bf_values[i] for i in peaks], [IE_values[i] for i in peaks], color='green', label='Local Maxima', zorder=5)
+
+    # Set title and labels
+    plt.title("Incident Energy vs I_bf")
+    plt.xlabel("Bolted Fault Current (I_bf) [kA]")
+    plt.ylabel("Incident Energy (IE) [cal/cm²]")
+    plt.legend()
+    plt.grid()
+
+    # Save the plot as an image file
+    plt.savefig(output_file_path, dpi=300)  # Save with 300 DPI for good quality
+    plt.close()  # Close the plot to avoid display in non-interactive environments
+
+    print(f"Graph saved as {output_file_path}")
+
+
+def process_scenarios_with_range(file_path):
+    """
+    Process scenarios and plot valid values of I_bf vs Incident Energy.
+    Generate a detailed and clean output report.
+    """
+    global I_arc_600, I_arc_2700, I_arc_14300, I_arc_less600
+    scenarios = read_scenarios_from_file(file_path)
+    results = []  # Collect results to write to the output file
+    valid_results = []  # Collect valid results for plotting
+
+    for scenario_index, params in enumerate(scenarios):
+        results.append(f"--- Scenario {scenario_index + 1} ---")
+        try:
+            # Extract and validate static parameters
+            G = params.get("G")
+            electrodeConfig = params.get("electrodeConfig")
+            voltage = params.get("voltage")
+            T = params.get("T")
+            D = params.get("D")
+            width = params.get("width")
+            height = params.get("height")
+            depth = params.get("depth")
+
+            validate_inputs(
+                G=G, voltage=voltage, T=T, D=D, width=width, height=height, depth=depth
+            )
+
+            results.append(f"Voltage: {voltage} kV | Electrode Config: {electrodeConfig}")
+            results.append(f"{'I_bf (kA)':<12}                {'IE (cal/cm²)':<15}")
+
+            # Iterate I_bf from 9999 to 1, decrementing by 0.1
+            I_bf_values = np.arange(9999, 0, -0.1)  # Using numpy's arange to create decimal steps
+            for I_bf in I_bf_values:
+                try:
+                    validate_inputs(I_bf=I_bf)
+
+                    # Calculate arcing currents
+                    I_arc_600 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 600)
+                    I_arc_2700 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 2700)
+                    I_arc_14300 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 14300)
+
+                    if 0.6 < voltage <= 15:
+                        I_arc_Final = calc_final_arc_current(voltage)
+                        CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
+                        IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
+
+                    elif 0.208 <= voltage <= 0.6:
+                        I_arc_Final = calc_final_arc_current_lv(voltage, I_bf, G, electrodeConfig)
+                        CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
+                        IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
+
+                    else:
+                        continue
+
+                    # Append valid result for plotting and reporting
+                    valid_results.append({'I_bf': I_bf, 'IE': IE})
+                    results.append(f"{I_bf:<12}           {IE:<15}")
+
+                except ValueError as ve:
+                    continue  # Skip invalid I_bf values
+
+        except ValueError as ve:
+            results.append(f"Scenario skipped due to invalid parameters: {ve}")
+
+    # Write results to a text file in the same folder as the input file
+    global folder_path, output_file_path
+    folder_path = os.path.dirname(file_path)
+    output_file_path = os.path.join(folder_path, "iteration_outputs.txt")
+
+    with open(output_file_path, 'w') as output_file:
+        output_file.write("\n".join(results))
+
+    print(f"Results written to {output_file_path}")
+
+    # Plot valid results
+    plot_valid_values(valid_results)
+
+    return output_file_path
+
+
+def browse_file():
+    """
+    Browse and select a file.
+    """
+    filepath = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+    if filepath:  # If a file is selected
+        file_path_entry.delete(0, tk.END)  # Clear previous text
+        file_path_entry.insert(0, filepath)  # Insert the selected file path into the entry field
+
+def submit():
+    """
+    Handle form submission.
+    """
+    file_path = file_path_entry.get()  # Get the file path from the entry
+    processing_mode = processing_mode_var.get()  # Get the selected processing mode
+
+    if file_path:
+        try:
+            if processing_mode == "Standard Processing":
+                output_file_path = process_scenarios(file_path)  # Call standard processing
+            elif processing_mode == "Range Processing":
+                output_file_path = process_scenarios_with_range(file_path)  # Call range processing
+
+            result_label.config(text=f"Processing complete. Results saved to:\n{output_file_path}")
+            root.quit()  # Close the Tkinter window after processing
+        except Exception as e:
+            result_label.config(text=f"Error: {e}")
     else:
-        # Low Voltage
-        I_bf = 45  # Example bolted fault current (kA)
-        G = 32  # Example gap distance (mm)
-        electrodeConfig = 'VCB'  # Example system type
-        voltage = 0.48  # (kV)
-        T = 61.3  # (ms)
-        D = 609.6  # Working Distance, in mm
-        width = 610  # (mm)
-        height = 610  # (mm)
-        depth = 254  # Only relevant for certain systems
-    
-    # Calculate arcing currents
-    I_arc_600 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 600)
-    I_arc_2700 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 2700)
-    I_arc_14300 = calc_intermediate_arcing_current(I_bf, G, electrodeConfig, 14300)
-    I_arc_less600 = calc_final_arc_current_lv(voltage, I_bf, G, electrodeConfig)
-    
-    # Return all necessary data
-    return {
-        "I_bf": I_bf,
-        "G": G,
-        "electrodeConfig": electrodeConfig,
-        "voltage": voltage,
-        "T": T,
-        "D": D,
-        "width": width,
-        "height": height,
-        "depth": depth,
-        "I_arc_600": I_arc_600,
-        "I_arc_2700": I_arc_2700,
-        "I_arc_14300": I_arc_14300,
-        "I_arc_less600": I_arc_less600
-    }
+        result_label.config(text="Please select a file.")
 
-# Loop through voltage scenarios
-while count < 3:
-    data = values(count)
-    I_bf = data["I_bf"]
-    G = data["G"]
-    electrodeConfig = data["electrodeConfig"]
-    voltage = data["voltage"]
-    T = data["T"]
-    D = data["D"]
-    width = data["width"]
-    height = data["height"]
-    depth = data["depth"]
-    
-    # Update global variables
-    I_arc_600 = data["I_arc_600"]
-    I_arc_2700 = data["I_arc_2700"]
-    I_arc_14300 = data["I_arc_14300"]
-    I_arc_less600 = data["I_arc_less600"]
-    
-    if 0.6 < voltage <= 15:
-        print(f"High Voltage")
-        I_arc_Final = calc_final_arc_current(voltage) 
-        print(f"Final arcing current: {I_arc_Final} kA")
-        CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
-        IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
-        print(f"Incident Energy: {IE} cal/cm2")
-        Boundary = calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig)
-        print(f"Arc Flash Boundary: {Boundary} mm")
-    elif 0.208 <= voltage <= 0.6:
-        print(f"Low Voltage")
-        I_arc_Final = calc_final_arc_current_lv(voltage, I_bf, G, electrodeConfig)  
-        print(f"Final arcing current: {I_arc_Final} kA")
-        CF = calculate_new_dimensions(electrodeConfig, width, height, depth, voltage)
-        IE = incident_energy(voltage, CF, T, G, D, I_bf, electrodeConfig)
-        print(f"Incident Energy: {IE} cal/cm2")
-        Boundary = calculate_boundary(voltage, CF, T, G, I_bf, electrodeConfig)
-        print(f"Arc Flash Boundary: {Boundary} mm")
-    
-    count += 1  # Increment count to move to the next scenario
+# Create the main window
+root = tk.Tk()
+# ==== DATABASE INIT START ====
+db = ArcFlashDatabase()
+# ==== DATABASE INIT END ====
+root.title("File Path Submission")
+
+# Create widgets
+label = tk.Label(root, text="Enter or browse to a text file:")
+label.pack(pady=5)
+
+file_path_entry = tk.Entry(root, width=40)
+file_path_entry.pack(pady=5)
+
+# ==== COMPONENT UI START ====
+mgmt_frame = tk.LabelFrame(root, text="Component Database")
+mgmt_frame.pack(pady=10, fill=tk.X)
+
+# Component Dropdown
+tk.Label(mgmt_frame, text="Component:").grid(row=0, column=0, padx=5)
+component_var = tk.StringVar()
+component_dropdown = ttk.Combobox(mgmt_frame, textvariable=component_var)
+component_dropdown.grid(row=0, column=1, padx=5)
+
+# New Component Entry
+tk.Label(mgmt_frame, text="New:").grid(row=1, column=0, padx=5)
+new_component_entry = tk.Entry(mgmt_frame)
+new_component_entry.grid(row=1, column=1, padx=5)
+
+# Data Entries
+tk.Label(mgmt_frame, text="X (Amps in KA):").grid(row=2, column=0, padx=5)
+x_entry = tk.Entry(mgmt_frame, width=10)
+x_entry.grid(row=2, column=1, padx=5)
+
+tk.Label(mgmt_frame, text="Y (Seconds):").grid(row=2, column=2, padx=5)
+y_entry = tk.Entry(mgmt_frame, width=10)
+y_entry.grid(row=2, column=3, padx=5)
+
+# Control Buttons
+tk.Button(mgmt_frame, text="Add Component", command=lambda: add_component(db, new_component_entry, component_dropdown, component_var)).grid(row=3, column=0, columnspan=2, pady=5)
+tk.Button(mgmt_frame, text="Add Data", command=lambda: add_data(db, component_var, x_entry, y_entry)).grid(row=3, column=2, columnspan=2, pady=5)
+tk.Button(mgmt_frame, text="Delete", command=lambda: delete_component(db, component_var, component_dropdown)).grid(row=4, column=0, columnspan=4, pady=5)
+
+# Initial component list update
+def update_component_list():
+    components = db.get_components()
+    component_dropdown['values'] = components
+    if components:
+        component_var.set(components[0])
+
+update_component_list()
+# ==== COMPONENT UI END ====
+
+browse_button = tk.Button(root, text="Browse", command=browse_file)
+browse_button.pack(pady=5)
+
+# Dropdown menu for selecting processing mode
+processing_mode_var = tk.StringVar(value="Standard Processing")
+processing_mode_label = tk.Label(root, text="Select Processing Mode:")
+processing_mode_label.pack(pady=5)
+
+processing_mode_dropdown = tk.OptionMenu(
+    root, 
+    processing_mode_var, 
+    "Standard Processing", 
+    "Range Processing"
+)
+processing_mode_dropdown.pack(pady=5)
+
+submit_button = tk.Button(root, text="Submit", command=submit)
+submit_button.pack(pady=5)
+
+result_label = tk.Label(root, text="", justify=tk.LEFT)
+result_label.pack(pady=10)
+
+# ==== DATABASE FUNCTIONS START ====
+def add_component(db, entry, dropdown, var):
+    new_name = entry.get()
+    if new_name:
+        if db.add_component(new_name):
+            entry.delete(0, tk.END)
+            components = db.get_components()
+            dropdown['values'] = components
+            var.set(new_name)
+            tk.messagebox.showinfo("Success", "Component added!")
+        else:
+            tk.messagebox.showerror("Error", "Component already exists!")
+
+def add_data(db, var, x_entry, y_entry):
+    component = var.get()
+    try:
+        x = float(x_entry.get())
+        y = float(y_entry.get())
+        if db.add_data_point(component, x, y):
+            x_entry.delete(0, tk.END)
+            y_entry.delete(0, tk.END)
+            tk.messagebox.showinfo("Success", "Data added!")
+        else:
+            tk.messagebox.showerror("Error", "Component not found!")
+    except ValueError:
+        tk.messagebox.showerror("Error", "Invalid X/Y values")
+
+def delete_component(db, var, dropdown):
+    component = var.get()
+    if component and tk.messagebox.askyesno("Confirm", f"Delete {component}?"):
+        db.delete_component(component)
+        components = db.get_components()
+        dropdown['values'] = components
+        if components:
+            var.set(components[0])
+        else:
+            var.set('')
+        tk.messagebox.showinfo("Deleted", f"{component} removed")
+# ==== DATABASE FUNCTIONS END ====
+
+# Run the GUI
+root.mainloop()
+
 
 
     
